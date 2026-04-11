@@ -5,17 +5,12 @@
 /bazel-*
 /.bazel/
 
-# Bazel local cache dirs (populated by scripts/setup-bazel-env.py, not committed)
-/.bcr/
-/.repo-cache/
-/.distdir/
-/.crate-cache/
-
 # Bazel disk cache (personal, not shared)
 /.cache/
 
-# direnv local overrides
+# Local overrides (not for sharing)
 /.envrc.local
+/.bazelrc.local
 
 # Editor / OS
 .DS_Store
