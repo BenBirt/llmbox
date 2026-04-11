@@ -1,12 +1,19 @@
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(about = "Execute LLM-generated JavaScript in a V8 sandbox")]
+struct Args {
+    /// Natural language prompt describing what the JavaScript should do
+    prompt: String,
+}
+
 fn main() {
-    let prompt = std::env::args()
-        .nth(1)
-        .expect("Usage: llmbox <prompt>");
+    let args = Args::parse();
 
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .expect("ANTHROPIC_API_KEY environment variable not set");
 
-    let js_code = query_llm(&api_key, &prompt);
+    let js_code = query_llm(&api_key, &args.prompt);
     let js_code = extract_code(&js_code);
     let result = execute_js(&js_code);
     println!("{}", result);
