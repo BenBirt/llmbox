@@ -4,5 +4,10 @@ rust_binary(
     name = "llmbox",
     srcs = ["src/main.rs"],
     edition = "2021",
-    deps = ["@crate_index//:v8"],
+    deps = [
+        "@crate_index//:v8",
+        "@crate_index//:ureq",
+        "@crate_index//:serde_json",
+        "@crate_index//:clap",
+    ],
 )
