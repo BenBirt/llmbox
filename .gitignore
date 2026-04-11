@@ -5,6 +5,13 @@
 /bazel-*
 /.bazel/
 
+# Bazel local cache dirs and offline-mirror workaround files (not committed)
+/.bcr/
+/.repo-cache/
+/.distdir/
+/.crate-cache/
+/.bazel-downloader.cfg
+
 # Bazel disk cache (personal, not shared)
 /.cache/
 
