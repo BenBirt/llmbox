@@ -96,6 +96,7 @@ fn extract_code_block(text: &str) -> Option<String> {
 }
 
 fn execute_js(js: &str) -> String {
+    // Fresh isolate + context every call — no JS state survives between executions.
     let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
     v8::scope!(let handle_scope, isolate);
 
