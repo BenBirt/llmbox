@@ -1,0 +1,22 @@
+# Prebuilt V8 artifacts for x86_64-unknown-linux-gnu.
+#
+# librusty_v8_gz   – the static library archive downloaded from the rusty_v8
+#                    GitHub releases page.  The v8 build.rs decompresses it
+#                    automatically when RUSTY_V8_ARCHIVE points here.
+#
+# src_binding_rs   – the prebuilt Rust FFI binding file for the release
+#                    profile.  The v8 build.rs uses it as-is when
+#                    RUSTY_V8_SRC_BINDING_PATH points here, so the compiler
+#                    never has to generate or download the bindings.
+
+filegroup(
+    name = "librusty_v8_gz",
+    srcs = ["librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "src_binding_rs",
+    srcs = ["src_binding_release_x86_64-unknown-linux-gnu.rs"],
+    visibility = ["//visibility:public"],
+)

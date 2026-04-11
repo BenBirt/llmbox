@@ -1,0 +1,33 @@
+# ---- Registry / cache: use local mirror (bcr.bazel.build unreachable) -------
+# Run scripts/setup-bazel-env.py once to populate these directories.
+common --registry=file:///home/user/llmbox/.bcr
+common --repository_cache=/home/user/llmbox/.repo-cache
+common --distdir=/home/user/llmbox/.distdir
+common --downloader_config=/home/user/llmbox/.bazel-downloader.cfg
+
+# ---- Hermeticity relaxations needed for the v8 crate ----------------------
+#
+# The v8 crate's build.rs places librusty_v8.a into a path derived from
+# $OUT_DIR by walking *up* three directory levels (matching cargo's layout
+# where target/release/build/<crate>/out is the OUT_DIR).  Under Bazel that
+# ends up outside the declared output sandbox, so we run the build-script
+# action and the Rustc action without the Linux sandbox.
+#
+# RUSTY_V8_ARCHIVE and RUSTY_V8_SRC_BINDING_PATH are set by direnv (.envrc)
+# to point at the prebuilt files checked in under third_party/v8/.
+# The --action_env lines below forward them into Bazel actions.
+
+build --strategy=CargoBuildScript=local
+build --strategy=CargoBuildScriptRun=local
+build --strategy=Rustc=local
+# Forward prebuilt V8 paths to build actions (absolute paths; matches .envrc).
+# CargoBuildScript runs without sandbox so the build script can access these.
+build --action_env=RUSTY_V8_ARCHIVE=/home/user/llmbox/third_party/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz
+build --action_env=RUSTY_V8_SRC_BINDING_PATH=/home/user/llmbox/third_party/v8/src_binding_release_x86_64-unknown-linux-gnu.rs
+
+# ---- General settings -------------------------------------------------------
+# Disk cache for faster incremental builds
+build --disk_cache=~/.cache/bazel-disk-cache
+
+# Show test output on failure
+test --test_output=errors

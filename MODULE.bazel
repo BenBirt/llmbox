@@ -1,0 +1,36 @@
+module(name = "llmbox", version = "0.1.0")
+
+bazel_dep(name = "rules_rust", version = "0.69.0")
+
+# ---------------------------------------------------------------------------
+# Rust toolchain
+# ---------------------------------------------------------------------------
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(edition = "2021")
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# ---------------------------------------------------------------------------
+# crate_universe: generate Bazel rules from Cargo.lock
+# ---------------------------------------------------------------------------
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+crate.from_cargo(
+    name = "crate_index",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+
+# The v8 crate's build.rs reads RUSTY_V8_ARCHIVE and RUSTY_V8_SRC_BINDING_PATH
+# from the environment to locate prebuilt artifacts. These are forwarded into
+# Bazel actions via --action_env in .bazelrc (with absolute paths so they work
+# even without direnv active). CargoBuildScript runs local (no sandbox) so it
+# can access the absolute paths on disk.
+crate.annotation(
+    crate = "v8",
+    version = "=147.1.0",
+    repositories = ["crate_index"],
+)
+
+use_repo(crate, "crate_index")

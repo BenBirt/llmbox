@@ -1,0 +1,23 @@
+# Rust
+/target/
+
+# Bazel
+/bazel-*
+/.bazel/
+
+# Bazel local cache dirs (populated by scripts/setup-bazel-env.py, not committed)
+/.bcr/
+/.repo-cache/
+/.distdir/
+/.crate-cache/
+
+# Bazel disk cache (personal, not shared)
+/.cache/
+
+# direnv local overrides
+/.envrc.local
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
