@@ -172,6 +172,60 @@ fn fs_write_callback<'s, 'i>(
     }
 }
 
+fn fs_list_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    // SAFETY: same as fs_read_callback.
+    let mount = unsafe {
+        let Ok(ext) = v8::Local::<v8::External>::try_from(args.data()) else {
+            throw_error(scope, "fs.list: internal error: missing external data");
+            return;
+        };
+        &*(ext.value() as *const FilesystemMount)
+    };
+    let path_str = if args.length() >= 1 {
+        match args.get(0).to_string(scope) {
+            Some(s) => s.to_rust_string_lossy(scope),
+            None => {
+                throw_error(scope, "fs.list: path argument is not a string");
+                return;
+            }
+        }
+    } else {
+        ".".to_string()
+    };
+    let target = mount.path.join(&path_str);
+    if !mount.is_within_mount(&target) {
+        throw_error(scope, "path escapes mount point");
+        return;
+    }
+    match std::fs::read_dir(&target) {
+        Ok(entries) => {
+            let items: Vec<serde_json::Value> = entries
+                .flatten()
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let kind = match e.file_type() {
+                        Ok(ft) if ft.is_dir() => "directory",
+                        Ok(_) => "file",
+                        Err(_) => "unknown",
+                    };
+                    serde_json::json!({"name": name, "type": kind})
+                })
+                .collect();
+            let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+            let Some(sv) = v8::String::new(scope, &json) else {
+                throw_error(scope, "fs.list: out of memory creating result");
+                return;
+            };
+            rv.set(sv.into());
+        }
+        Err(e) => throw_error(scope, &e.to_string()),
+    }
+}
+
 fn extract_headers<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     val: v8::Local<'s, v8::Value>,
@@ -327,10 +381,16 @@ trait Capability {
 
 impl Capability for FilesystemMount {
     fn system_prompt_snippet(&self) -> String {
-        let mut lines = vec![format!(
-            "- `fs.read(path)` — reads the file at `path` (relative to `{}`) and returns its contents as a string.",
-            self.path.display()
-        )];
+        let mut lines = vec![
+            format!(
+                "- `fs.read(path)` — reads the file at `path` (relative to `{}`) and returns its contents as a string.",
+                self.path.display()
+            ),
+            format!(
+                "- `fs.list(path)` — lists the directory at `path` (relative to `{}`); returns a JSON string `[{{\"name\":\"...\",\"type\":\"file\"|\"directory\"}}, ...]`. Omit `path` to list the mount root.",
+                self.path.display()
+            ),
+        ];
         if self.mode == MountMode::ReadWrite {
             lines.push(format!(
                 "- `fs.write(path, content)` — writes `content` to the file at `path` (relative to `{}`).",
@@ -358,6 +418,14 @@ impl Capability for FilesystemMount {
         fs_obj.set(
             v8::String::new(scope, "read").expect("out of memory").into(),
             read_fn.into(),
+        );
+
+        let list_fn = v8::FunctionTemplate::builder(fs_list_callback)
+            .data(data)
+            .build(scope);
+        fs_obj.set(
+            v8::String::new(scope, "list").expect("out of memory").into(),
+            list_fn.into(),
         );
 
         if self.mode == MountMode::ReadWrite {
