@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 enum LlmError {
-    #[error("Anthropic API request failed: {0}")]
+    #[error("LLM API request failed: {0}")]
     Request(#[from] ureq::Error),
-    #[error("Failed to parse Anthropic API response: {0}")]
+    #[error("Failed to parse LLM API response: {0}")]
     Parse(#[from] std::io::Error),
-    #[error("Unexpected response shape from Anthropic API")]
+    #[error("Unexpected response shape from LLM API")]
     UnexpectedShape,
 }
 
@@ -17,6 +17,14 @@ enum LlmError {
 struct Args {
     /// Natural language prompt describing what the JavaScript should do
     prompt: String,
+
+    /// LLM provider to use (anthropic or gemini)
+    #[arg(long = "provider", default_value = "anthropic", value_name = "PROVIDER")]
+    provider: String,
+
+    /// Model to use (defaults to claude-sonnet-4-6 for Anthropic, gemini-2.0-flash for Gemini)
+    #[arg(long = "model", value_name = "MODEL")]
+    model: Option<String>,
 
     /// Mount a host directory into the sandbox (format: /path:ro or /path:rw)
     #[arg(long = "mount", value_name = "PATH:MODE")]
@@ -29,6 +37,18 @@ struct Args {
     /// Expose a specific environment variable to JavaScript (can be repeated)
     #[arg(long = "env", value_name = "VAR_NAME")]
     env_vars: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Provider {
+    Anthropic,
+    Gemini,
+}
+
+struct ProviderConfig {
+    provider: Provider,
+    api_key: String,
+    model: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -570,16 +590,43 @@ fn main() {
         std::process::exit(1);
     });
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
-        eprintln!("Error: ANTHROPIC_API_KEY environment variable not set");
-        std::process::exit(1);
-    });
+    let provider = match args.provider.as_str() {
+        "anthropic" => Provider::Anthropic,
+        "gemini" => Provider::Gemini,
+        other => {
+            eprintln!("Error: unknown provider {:?}; expected anthropic or gemini", other);
+            std::process::exit(1);
+        }
+    };
+
+    let (api_key, default_model) = match provider {
+        Provider::Anthropic => (
+            std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
+                eprintln!("Error: ANTHROPIC_API_KEY environment variable not set");
+                std::process::exit(1);
+            }),
+            "claude-sonnet-4-6".to_string(),
+        ),
+        Provider::Gemini => (
+            std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| {
+                eprintln!("Error: GEMINI_API_KEY environment variable not set");
+                std::process::exit(1);
+            }),
+            "gemini-2.0-flash".to_string(),
+        ),
+    };
+
+    let provider_config = ProviderConfig {
+        provider,
+        api_key,
+        model: args.model.unwrap_or(default_model),
+    };
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
 
-    let final_answer = run_loop(&api_key, &args.prompt, &config).unwrap_or_else(|e| {
+    let final_answer = run_loop(&provider_config, &args.prompt, &config).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         std::process::exit(1);
     });
@@ -589,13 +636,30 @@ fn main() {
     v8::V8::dispose_platform();
 }
 
-fn run_loop(api_key: &str, prompt: &str, config: &SandboxConfig) -> Result<String, LlmError> {
+fn run_loop(
+    provider_config: &ProviderConfig,
+    prompt: &str,
+    config: &SandboxConfig,
+) -> Result<String, LlmError> {
     let system_prompt = config.build_system_prompt();
     let mut messages: Vec<serde_json::Value> =
         vec![serde_json::json!({"role": "user", "content": prompt})];
 
     for _ in 0..MAX_ROUNDS {
-        let response = query_llm(api_key, &messages, &system_prompt)?;
+        let response = match provider_config.provider {
+            Provider::Anthropic => query_anthropic(
+                &provider_config.api_key,
+                &provider_config.model,
+                &messages,
+                &system_prompt,
+            )?,
+            Provider::Gemini => query_gemini(
+                &provider_config.api_key,
+                &provider_config.model,
+                &messages,
+                &system_prompt,
+            )?,
+        };
         messages.push(serde_json::json!({"role": "assistant", "content": response}));
 
         match extract_code_block(&response) {
@@ -614,9 +678,14 @@ fn run_loop(api_key: &str, prompt: &str, config: &SandboxConfig) -> Result<Strin
     Ok(format!("Reached maximum rounds ({})", MAX_ROUNDS))
 }
 
-fn query_llm(api_key: &str, messages: &[serde_json::Value], system_prompt: &str) -> Result<String, LlmError> {
+fn query_anthropic(
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    system_prompt: &str,
+) -> Result<String, LlmError> {
     let body = serde_json::json!({
-        "model": "claude-sonnet-4-6",
+        "model": model,
         "max_tokens": 1024,
         "system": system_prompt,
         "messages": messages,
@@ -630,6 +699,51 @@ fn query_llm(api_key: &str, messages: &[serde_json::Value], system_prompt: &str)
         .into_json()?;
 
     response["content"][0]["text"]
+        .as_str()
+        .ok_or(LlmError::UnexpectedShape)
+        .map(str::to_string)
+}
+
+fn query_gemini(
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    system_prompt: &str,
+) -> Result<String, LlmError> {
+    // Gemini uses "model" for the assistant role and wraps text in parts arrays.
+    let contents: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|msg| {
+            let role = if msg["role"].as_str() == Some("assistant") { "model" } else { "user" };
+            let text = msg["content"].as_str().unwrap_or("");
+            serde_json::json!({
+                "role": role,
+                "parts": [{"text": text}]
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": 1024
+        }
+    });
+
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let response: serde_json::Value = ureq::post(&url)
+        .set("content-type", "application/json")
+        .send_json(body)?
+        .into_json()?;
+
+    response["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .ok_or(LlmError::UnexpectedShape)
         .map(str::to_string)
