@@ -2,6 +2,16 @@ use clap::Parser;
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+#[derive(Debug, thiserror::Error)]
+enum LlmError {
+    #[error("Anthropic API request failed: {0}")]
+    Request(#[from] ureq::Error),
+    #[error("Failed to parse Anthropic API response: {0}")]
+    Parse(#[from] std::io::Error),
+    #[error("Unexpected response shape from Anthropic API")]
+    UnexpectedShape,
+}
+
 #[derive(Parser)]
 #[command(about = "Execute LLM-generated JavaScript in a V8 sandbox")]
 struct Args {
@@ -72,7 +82,7 @@ impl FilesystemMount {
 // ReturnValue<'s>)`. Stateless fn items with late-bound lifetimes satisfy this.
 
 fn throw_error(scope: &mut v8::PinScope, msg: &str) {
-    let s = v8::String::new(scope, msg).unwrap();
+    let s = v8::String::new(scope, msg).expect("out of memory");
     let exc = v8::Exception::error(scope, s);
     scope.throw_exception(exc);
 }
@@ -83,7 +93,10 @@ fn console_log_callback<'s, 'i>(
     _rv: v8::ReturnValue<'s>,
 ) {
     let parts: Vec<String> = (0..args.length())
-        .map(|i| args.get(i).to_string(scope).unwrap().to_rust_string_lossy(scope))
+        .map(|i| match args.get(i).to_string(scope) {
+            Some(s) => s.to_rust_string_lossy(scope),
+            None => "<unstringifiable>".to_string(),
+        })
         .collect();
     eprintln!("{}", parts.join(" "));
 }
@@ -96,11 +109,17 @@ fn fs_read_callback<'s, 'i>(
     // SAFETY: The FilesystemMount pointer stored in the External outlives this callback because
     // SandboxConfig (which owns the mount) is held by main() and outlives every execute_js() call.
     let mount = unsafe {
-        let ext = v8::Local::<v8::External>::try_from(args.data())
-            .expect("fs.read: missing external data");
+        let Ok(ext) = v8::Local::<v8::External>::try_from(args.data()) else {
+            throw_error(scope, "fs.read: internal error: missing external data");
+            return;
+        };
         &*(ext.value() as *const FilesystemMount)
     };
-    let path_str = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let Some(path_v8) = args.get(0).to_string(scope) else {
+        throw_error(scope, "fs.read: path argument is not a string");
+        return;
+    };
+    let path_str = path_v8.to_rust_string_lossy(scope);
     let target = mount.path.join(&path_str);
     if !mount.is_within_mount(&target) {
         throw_error(scope, "path escapes mount point");
@@ -108,7 +127,10 @@ fn fs_read_callback<'s, 'i>(
     }
     match std::fs::read_to_string(&target) {
         Ok(contents) => {
-            let s = v8::String::new(scope, &contents).unwrap();
+            let Some(s) = v8::String::new(scope, &contents) else {
+                throw_error(scope, "fs.read: out of memory creating result");
+                return;
+            };
             rv.set(s.into());
         }
         Err(e) => throw_error(scope, &e.to_string()),
@@ -123,12 +145,22 @@ fn fs_write_callback<'s, 'i>(
 ) {
     // SAFETY: same as fs_read_callback.
     let mount = unsafe {
-        let ext = v8::Local::<v8::External>::try_from(args.data())
-            .expect("fs.write: missing external data");
+        let Ok(ext) = v8::Local::<v8::External>::try_from(args.data()) else {
+            throw_error(scope, "fs.write: internal error: missing external data");
+            return;
+        };
         &*(ext.value() as *const FilesystemMount)
     };
-    let path_str = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
-    let contents = args.get(1).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let Some(path_v8) = args.get(0).to_string(scope) else {
+        throw_error(scope, "fs.write: path argument is not a string");
+        return;
+    };
+    let path_str = path_v8.to_rust_string_lossy(scope);
+    let Some(contents_v8) = args.get(1).to_string(scope) else {
+        throw_error(scope, "fs.write: content argument is not a string");
+        return;
+    };
+    let contents = contents_v8.to_rust_string_lossy(scope);
     let target = mount.path.join(&path_str);
     if !mount.is_within_mount(&target) {
         throw_error(scope, "path escapes mount point");
@@ -167,7 +199,11 @@ fn http_get_callback<'s, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let url = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let Some(url_v8) = args.get(0).to_string(scope) else {
+        throw_error(scope, "http.get: url argument is not a string");
+        return;
+    };
+    let url = url_v8.to_rust_string_lossy(scope);
     let mut req = ureq::get(&url);
     if args.length() >= 2 {
         let hval = args.get(1);
@@ -179,7 +215,13 @@ fn http_get_callback<'s, 'i>(
     }
     match req.call() {
         Ok(resp) => match resp.into_string() {
-            Ok(body) => rv.set(v8::String::new(scope, &body).unwrap().into()),
+            Ok(body) => {
+                let Some(sv) = v8::String::new(scope, &body) else {
+                    throw_error(scope, "http.get: out of memory creating result");
+                    return;
+                };
+                rv.set(sv.into());
+            }
             Err(e) => throw_error(scope, &e.to_string()),
         },
         Err(ureq::Error::Status(code, resp)) => {
@@ -195,8 +237,16 @@ fn http_post_callback<'s, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let url = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
-    let body = args.get(1).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let Some(url_v8) = args.get(0).to_string(scope) else {
+        throw_error(scope, "http.post: url argument is not a string");
+        return;
+    };
+    let url = url_v8.to_rust_string_lossy(scope);
+    let Some(body_v8) = args.get(1).to_string(scope) else {
+        throw_error(scope, "http.post: body argument is not a string");
+        return;
+    };
+    let body = body_v8.to_rust_string_lossy(scope);
     let mut req = ureq::post(&url);
     if args.length() >= 3 {
         let hval = args.get(2);
@@ -208,7 +258,13 @@ fn http_post_callback<'s, 'i>(
     }
     match req.send_string(&body) {
         Ok(resp) => match resp.into_string() {
-            Ok(b) => rv.set(v8::String::new(scope, &b).unwrap().into()),
+            Ok(b) => {
+                let Some(sv) = v8::String::new(scope, &b) else {
+                    throw_error(scope, "http.post: out of memory creating result");
+                    return;
+                };
+                rv.set(sv.into());
+            }
             Err(e) => throw_error(scope, &e.to_string()),
         },
         Err(ureq::Error::Status(code, resp)) => {
@@ -227,17 +283,29 @@ fn env_get_callback<'s, 'i>(
     // SAFETY: The EnvCapability pointer stored in the External outlives this callback because
     // SandboxConfig (which owns the capability) is held by main() and outlives every execute_js() call.
     let cap = unsafe {
-        let ext = v8::Local::<v8::External>::try_from(args.data())
-            .expect("env.get: missing external data");
+        let Ok(ext) = v8::Local::<v8::External>::try_from(args.data()) else {
+            throw_error(scope, "env.get: internal error: missing external data");
+            return;
+        };
         &*(ext.value() as *const EnvCapability)
     };
-    let name = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let Some(name_v8) = args.get(0).to_string(scope) else {
+        throw_error(scope, "env.get: name argument is not a string");
+        return;
+    };
+    let name = name_v8.to_rust_string_lossy(scope);
     if !cap.allowlist.contains(&name) {
         rv.set_null();
         return;
     }
     match std::env::var(&name) {
-        Ok(val) => rv.set(v8::String::new(scope, &val).unwrap().into()),
+        Ok(val) => {
+            let Some(sv) = v8::String::new(scope, &val) else {
+                throw_error(scope, "env.get: out of memory creating result");
+                return;
+            };
+            rv.set(sv.into());
+        }
         Err(_) => rv.set_null(),
     }
 }
@@ -288,7 +356,7 @@ impl Capability for FilesystemMount {
             .data(data)
             .build(scope);
         fs_obj.set(
-            v8::String::new(scope, "read").unwrap().into(),
+            v8::String::new(scope, "read").expect("out of memory").into(),
             read_fn.into(),
         );
 
@@ -297,12 +365,12 @@ impl Capability for FilesystemMount {
                 .data(data)
                 .build(scope);
             fs_obj.set(
-                v8::String::new(scope, "write").unwrap().into(),
+                v8::String::new(scope, "write").expect("out of memory").into(),
                 write_fn.into(),
             );
         }
 
-        global.set(v8::String::new(scope, "fs").unwrap().into(), fs_obj.into());
+        global.set(v8::String::new(scope, "fs").expect("out of memory").into(), fs_obj.into());
     }
 }
 
@@ -326,10 +394,10 @@ Throws on network error or non-2xx status.\n\
     ) {
         let http_obj = v8::ObjectTemplate::new(scope);
         let get_fn = v8::FunctionTemplate::new(scope, http_get_callback);
-        http_obj.set(v8::String::new(scope, "get").unwrap().into(), get_fn.into());
+        http_obj.set(v8::String::new(scope, "get").expect("out of memory").into(), get_fn.into());
         let post_fn = v8::FunctionTemplate::new(scope, http_post_callback);
-        http_obj.set(v8::String::new(scope, "post").unwrap().into(), post_fn.into());
-        global.set(v8::String::new(scope, "http").unwrap().into(), http_obj.into());
+        http_obj.set(v8::String::new(scope, "post").expect("out of memory").into(), post_fn.into());
+        global.set(v8::String::new(scope, "http").expect("out of memory").into(), http_obj.into());
     }
 }
 
@@ -355,8 +423,8 @@ or `null` if it is not set. Only these variables are accessible: {}.",
             v8::External::new(scope, self as *const Self as *mut c_void).into();
         let env_obj = v8::ObjectTemplate::new(scope);
         let get_fn = v8::FunctionTemplate::builder(env_get_callback).data(data).build(scope);
-        env_obj.set(v8::String::new(scope, "get").unwrap().into(), get_fn.into());
-        global.set(v8::String::new(scope, "env").unwrap().into(), env_obj.into());
+        env_obj.set(v8::String::new(scope, "get").expect("out of memory").into(), get_fn.into());
+        global.set(v8::String::new(scope, "env").expect("out of memory").into(), env_obj.into());
     }
 }
 
@@ -411,8 +479,8 @@ stderr and does not affect the return value.";
         // Always register console.log.
         let console_obj = v8::ObjectTemplate::new(scope);
         let log_fn = v8::FunctionTemplate::new(scope, console_log_callback);
-        console_obj.set(v8::String::new(scope, "log").unwrap().into(), log_fn.into());
-        global.set(v8::String::new(scope, "console").unwrap().into(), console_obj.into());
+        console_obj.set(v8::String::new(scope, "log").expect("out of memory").into(), log_fn.into());
+        global.set(v8::String::new(scope, "console").expect("out of memory").into(), console_obj.into());
 
         for cap in &self.capabilities {
             cap.register(scope, global);
@@ -434,27 +502,32 @@ fn main() {
         std::process::exit(1);
     });
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .expect("ANTHROPIC_API_KEY environment variable not set");
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
+        eprintln!("Error: ANTHROPIC_API_KEY environment variable not set");
+        std::process::exit(1);
+    });
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
 
-    let final_answer = run_loop(&api_key, &args.prompt, &config);
+    let final_answer = run_loop(&api_key, &args.prompt, &config).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
     println!("{}", final_answer);
 
     unsafe { v8::V8::dispose() };
     v8::V8::dispose_platform();
 }
 
-fn run_loop(api_key: &str, prompt: &str, config: &SandboxConfig) -> String {
+fn run_loop(api_key: &str, prompt: &str, config: &SandboxConfig) -> Result<String, LlmError> {
     let system_prompt = config.build_system_prompt();
     let mut messages: Vec<serde_json::Value> =
         vec![serde_json::json!({"role": "user", "content": prompt})];
 
     for _ in 0..MAX_ROUNDS {
-        let response = query_llm(api_key, &messages, &system_prompt);
+        let response = query_llm(api_key, &messages, &system_prompt)?;
         messages.push(serde_json::json!({"role": "assistant", "content": response}));
 
         match extract_code_block(&response) {
@@ -466,14 +539,14 @@ fn run_loop(api_key: &str, prompt: &str, config: &SandboxConfig) -> String {
                     "content": format!("Result: {}", result)
                 }));
             }
-            None => return response,
+            None => return Ok(response),
         }
     }
 
-    format!("Reached maximum rounds ({})", MAX_ROUNDS)
+    Ok(format!("Reached maximum rounds ({})", MAX_ROUNDS))
 }
 
-fn query_llm(api_key: &str, messages: &[serde_json::Value], system_prompt: &str) -> String {
+fn query_llm(api_key: &str, messages: &[serde_json::Value], system_prompt: &str) -> Result<String, LlmError> {
     let body = serde_json::json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 1024,
@@ -485,15 +558,13 @@ fn query_llm(api_key: &str, messages: &[serde_json::Value], system_prompt: &str)
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")
-        .send_json(body)
-        .expect("Anthropic API request failed")
-        .into_json()
-        .expect("Failed to parse Anthropic API response");
+        .send_json(body)?
+        .into_json()?;
 
     response["content"][0]["text"]
         .as_str()
-        .expect("Unexpected response shape from Anthropic API")
-        .to_string()
+        .ok_or(LlmError::UnexpectedShape)
+        .map(str::to_string)
 }
 
 /// Returns `Some(code)` if the response contains a JS code block, `None` if it is a plain-text
@@ -518,7 +589,9 @@ fn execute_js(js: &str, config: &SandboxConfig) -> String {
     let context = config.setup_context(handle_scope);
     let scope = &v8::ContextScope::new(handle_scope, context);
 
-    let code = v8::String::new(scope, js).expect("Failed to create V8 string");
+    let Some(code) = v8::String::new(scope, js) else {
+        return "Error: out of memory creating V8 string".to_string();
+    };
 
     let script = match v8::Script::compile(scope, code, None) {
         Some(s) => s,
@@ -526,10 +599,10 @@ fn execute_js(js: &str, config: &SandboxConfig) -> String {
     };
 
     match script.run(scope) {
-        Some(val) => {
-            let s = val.to_string(scope).unwrap();
-            s.to_rust_string_lossy(scope)
-        }
+        Some(val) => match val.to_string(scope) {
+            Some(s) => s.to_rust_string_lossy(scope),
+            None => String::new(),
+        },
         None => "Error: JS runtime error".to_string(),
     }
 }
