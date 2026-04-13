@@ -11,6 +11,14 @@ struct Args {
     /// Mount a host directory into the sandbox (format: /path:ro or /path:rw)
     #[arg(long = "mount", value_name = "PATH:MODE")]
     mounts: Vec<String>,
+
+    /// Enable HTTP access from JavaScript (http.get, http.post)
+    #[arg(long = "http")]
+    http: bool,
+
+    /// Expose a specific environment variable to JavaScript (can be repeated)
+    #[arg(long = "env", value_name = "VAR_NAME")]
+    env_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +71,23 @@ impl FilesystemMount {
 // V8 callbacks must match `for<'s, 'i> Fn(&mut PinScope<'s, 'i>, FunctionCallbackArguments<'s>,
 // ReturnValue<'s>)`. Stateless fn items with late-bound lifetimes satisfy this.
 
+fn throw_error(scope: &mut v8::PinScope, msg: &str) {
+    let s = v8::String::new(scope, msg).unwrap();
+    let exc = v8::Exception::error(scope, s);
+    scope.throw_exception(exc);
+}
+
+fn console_log_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let parts: Vec<String> = (0..args.length())
+        .map(|i| args.get(i).to_string(scope).unwrap().to_rust_string_lossy(scope))
+        .collect();
+    eprintln!("{}", parts.join(" "));
+}
+
 fn fs_read_callback<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -78,9 +103,7 @@ fn fs_read_callback<'s, 'i>(
     let path_str = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
     let target = mount.path.join(&path_str);
     if !mount.is_within_mount(&target) {
-        let msg = v8::String::new(scope, "path escapes mount point").unwrap();
-        let exc = v8::Exception::error(scope, msg);
-        scope.throw_exception(exc);
+        throw_error(scope, "path escapes mount point");
         return;
     }
     match std::fs::read_to_string(&target) {
@@ -88,11 +111,7 @@ fn fs_read_callback<'s, 'i>(
             let s = v8::String::new(scope, &contents).unwrap();
             rv.set(s.into());
         }
-        Err(e) => {
-            let msg = v8::String::new(scope, &e.to_string()).unwrap();
-            let exc = v8::Exception::error(scope, msg);
-            scope.throw_exception(exc);
-        }
+        Err(e) => throw_error(scope, &e.to_string()),
     }
 }
 
@@ -112,18 +131,114 @@ fn fs_write_callback<'s, 'i>(
     let contents = args.get(1).to_string(scope).unwrap().to_rust_string_lossy(scope);
     let target = mount.path.join(&path_str);
     if !mount.is_within_mount(&target) {
-        let msg = v8::String::new(scope, "path escapes mount point").unwrap();
-        let exc = v8::Exception::error(scope, msg);
-        scope.throw_exception(exc);
+        throw_error(scope, "path escapes mount point");
         return;
     }
     match std::fs::write(&target, contents.as_bytes()) {
         Ok(()) => rv.set_undefined(),
-        Err(e) => {
-            let msg = v8::String::new(scope, &e.to_string()).unwrap();
-            let exc = v8::Exception::error(scope, msg);
-            scope.throw_exception(exc);
+        Err(e) => throw_error(scope, &e.to_string()),
+    }
+}
+
+fn extract_headers<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    val: v8::Local<'s, v8::Value>,
+) -> Vec<(String, String)> {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(val) else {
+        return vec![];
+    };
+    let Some(names) = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default()) else {
+        return vec![];
+    };
+    (0..names.length())
+        .filter_map(|i| {
+            let key = names.get_index(scope, i)?;
+            let val = obj.get(scope, key)?;
+            Some((
+                key.to_string(scope)?.to_rust_string_lossy(scope),
+                val.to_string(scope)?.to_rust_string_lossy(scope),
+            ))
+        })
+        .collect()
+}
+
+fn http_get_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let url = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let mut req = ureq::get(&url);
+    if args.length() >= 2 {
+        let hval = args.get(1);
+        if hval.is_object() {
+            for (k, v) in extract_headers(scope, hval) {
+                req = req.set(&k, &v);
+            }
         }
+    }
+    match req.call() {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => rv.set(v8::String::new(scope, &body).unwrap().into()),
+            Err(e) => throw_error(scope, &e.to_string()),
+        },
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            throw_error(scope, &format!("HTTP {}: {}", code, body));
+        }
+        Err(e) => throw_error(scope, &e.to_string()),
+    }
+}
+
+fn http_post_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let url = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let body = args.get(1).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    let mut req = ureq::post(&url);
+    if args.length() >= 3 {
+        let hval = args.get(2);
+        if hval.is_object() {
+            for (k, v) in extract_headers(scope, hval) {
+                req = req.set(&k, &v);
+            }
+        }
+    }
+    match req.send_string(&body) {
+        Ok(resp) => match resp.into_string() {
+            Ok(b) => rv.set(v8::String::new(scope, &b).unwrap().into()),
+            Err(e) => throw_error(scope, &e.to_string()),
+        },
+        Err(ureq::Error::Status(code, resp)) => {
+            let b = resp.into_string().unwrap_or_default();
+            throw_error(scope, &format!("HTTP {}: {}", code, b));
+        }
+        Err(e) => throw_error(scope, &e.to_string()),
+    }
+}
+
+fn env_get_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    // SAFETY: The EnvCapability pointer stored in the External outlives this callback because
+    // SandboxConfig (which owns the capability) is held by main() and outlives every execute_js() call.
+    let cap = unsafe {
+        let ext = v8::Local::<v8::External>::try_from(args.data())
+            .expect("env.get: missing external data");
+        &*(ext.value() as *const EnvCapability)
+    };
+    let name = args.get(0).to_string(scope).unwrap().to_rust_string_lossy(scope);
+    if !cap.allowlist.contains(&name) {
+        rv.set_null();
+        return;
+    }
+    match std::env::var(&name) {
+        Ok(val) => rv.set(v8::String::new(scope, &val).unwrap().into()),
+        Err(_) => rv.set_null(),
     }
 }
 
@@ -191,6 +306,60 @@ impl Capability for FilesystemMount {
     }
 }
 
+struct HttpCapability;
+
+impl Capability for HttpCapability {
+    fn system_prompt_snippet(&self) -> String {
+        "\
+- `http.get(url)` — performs an HTTP GET and returns the response body as a string. \
+Throws on network error or non-2xx status.\n\
+- `http.get(url, headers)` — same, with `headers` as an object of extra request headers.\n\
+- `http.post(url, body)` — performs an HTTP POST with a string body, returns the response body.\n\
+- `http.post(url, body, headers)` — same, with `headers` as an object of extra request headers."
+            .to_string()
+    }
+
+    fn register<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_, ()>,
+        global: v8::Local<'s, v8::ObjectTemplate>,
+    ) {
+        let http_obj = v8::ObjectTemplate::new(scope);
+        let get_fn = v8::FunctionTemplate::new(scope, http_get_callback);
+        http_obj.set(v8::String::new(scope, "get").unwrap().into(), get_fn.into());
+        let post_fn = v8::FunctionTemplate::new(scope, http_post_callback);
+        http_obj.set(v8::String::new(scope, "post").unwrap().into(), post_fn.into());
+        global.set(v8::String::new(scope, "http").unwrap().into(), http_obj.into());
+    }
+}
+
+struct EnvCapability {
+    allowlist: Vec<String>,
+}
+
+impl Capability for EnvCapability {
+    fn system_prompt_snippet(&self) -> String {
+        format!(
+            "- `env.get(name)` — returns the value of environment variable `name` as a string, \
+or `null` if it is not set. Only these variables are accessible: {}.",
+            self.allowlist.iter().map(|v| format!("`{}`", v)).collect::<Vec<_>>().join(", ")
+        )
+    }
+
+    fn register<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_, ()>,
+        global: v8::Local<'s, v8::ObjectTemplate>,
+    ) {
+        let data: v8::Local<v8::Value> =
+            v8::External::new(scope, self as *const Self as *mut c_void).into();
+        let env_obj = v8::ObjectTemplate::new(scope);
+        let get_fn = v8::FunctionTemplate::builder(env_get_callback).data(data).build(scope);
+        env_obj.set(v8::String::new(scope, "get").unwrap().into(), get_fn.into());
+        global.set(v8::String::new(scope, "env").unwrap().into(), env_obj.into());
+    }
+}
+
 struct SandboxConfig {
     capabilities: Vec<Box<dyn Capability>>,
 }
@@ -201,6 +370,12 @@ impl SandboxConfig {
         for spec in &args.mounts {
             capabilities.push(Box::new(FilesystemMount::parse(spec)?));
         }
+        if args.http {
+            capabilities.push(Box::new(HttpCapability));
+        }
+        if !args.env_vars.is_empty() {
+            capabilities.push(Box::new(EnvCapability { allowlist: args.env_vars.clone() }));
+        }
         Ok(SandboxConfig { capabilities })
     }
 
@@ -210,7 +385,8 @@ environment. When you need to compute something or run code, respond with a ```j
 block. The code will be executed and the result fed back to you as the next user message. You can \
 iterate — write code, observe the result, write more code if needed. When you have a final answer \
 for the user, respond in plain text without a code block. The last expression in your JavaScript \
-code will be its return value.";
+code will be its return value. You may use `console.log(...)` for debug output; it is printed to \
+stderr and does not affect the return value.";
 
         let snippets: Vec<String> =
             self.capabilities.iter().map(|c| c.system_prompt_snippet()).collect();
@@ -230,13 +406,18 @@ code will be its return value.";
         &self,
         scope: &mut v8::PinScope<'s, '_, ()>,
     ) -> v8::Local<'s, v8::Context> {
-        if self.capabilities.is_empty() {
-            return v8::Context::new(scope, Default::default());
-        }
         let global = v8::ObjectTemplate::new(scope);
+
+        // Always register console.log.
+        let console_obj = v8::ObjectTemplate::new(scope);
+        let log_fn = v8::FunctionTemplate::new(scope, console_log_callback);
+        console_obj.set(v8::String::new(scope, "log").unwrap().into(), log_fn.into());
+        global.set(v8::String::new(scope, "console").unwrap().into(), console_obj.into());
+
         for cap in &self.capabilities {
             cap.register(scope, global);
         }
+
         v8::Context::new(
             scope,
             v8::ContextOptions { global_template: Some(global), ..Default::default() },
