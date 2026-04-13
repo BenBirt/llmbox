@@ -82,7 +82,7 @@ impl FilesystemMount {
 // ReturnValue<'s>)`. Stateless fn items with late-bound lifetimes satisfy this.
 
 fn throw_error(scope: &mut v8::PinScope, msg: &str) {
-    let Some(s) = v8::String::new(scope, msg) else { return };
+    let s = v8::String::new(scope, msg).expect("out of memory");
     let exc = v8::Exception::error(scope, s);
     scope.throw_exception(exc);
 }
@@ -93,8 +93,9 @@ fn console_log_callback<'s, 'i>(
     _rv: v8::ReturnValue<'s>,
 ) {
     let parts: Vec<String> = (0..args.length())
-        .filter_map(|i| {
-            args.get(i).to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+        .map(|i| match args.get(i).to_string(scope) {
+            Some(s) => s.to_rust_string_lossy(scope),
+            None => "<unstringifiable>".to_string(),
         })
         .collect();
     eprintln!("{}", parts.join(" "));
