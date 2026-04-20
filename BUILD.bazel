@@ -9,5 +9,6 @@ rust_binary(
         "@crate_index//:ureq",
         "@crate_index//:serde_json",
         "@crate_index//:clap",
+        "@crate_index//:thiserror",
     ],
 )
