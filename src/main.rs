@@ -38,8 +38,8 @@ struct Args {
     #[arg(long = "env", value_name = "VAR_NAME")]
     env_vars: Vec<String>,
 
-    /// Declare a process capability (format: NAME:effect1,effect2; e.g. grep:reads-fs)
-    #[arg(long = "process", value_name = "NAME:EFFECTS")]
+    /// Grant a process capability by name (must be in llmbox's registry; e.g. grep, find, git)
+    #[arg(long = "process", value_name = "NAME")]
     processes: Vec<String>,
 }
 
@@ -62,6 +62,8 @@ enum MountMode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // HttpOut/HttpIn are part of the canonical effect vocabulary; no registry
+                    // entry uses them yet, but the vocabulary is the stable artifact.
 enum Effect {
     ReadsFs,
     WritesFs,
@@ -70,19 +72,6 @@ enum Effect {
 }
 
 impl Effect {
-    fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "reads-fs" => Ok(Effect::ReadsFs),
-            "writes-fs" => Ok(Effect::WritesFs),
-            "http-out" => Ok(Effect::HttpOut),
-            "http-in" => Ok(Effect::HttpIn),
-            other => Err(format!(
-                "unknown effect {:?}; expected reads-fs, writes-fs, http-out, or http-in",
-                other
-            )),
-        }
-    }
-
     fn as_str(&self) -> &'static str {
         match self {
             Effect::ReadsFs => "reads-fs",
@@ -90,6 +79,18 @@ impl Effect {
             Effect::HttpOut => "http-out",
             Effect::HttpIn => "http-in",
         }
+    }
+}
+
+/// Registry of process tools llmbox knows about, with their declared effects.
+/// Declarations here are the source of truth for what a tool may do; extending
+/// this list is a conscious, reviewable change to the llmbox source.
+fn known_process_effects(name: &str) -> Option<Vec<Effect>> {
+    match name {
+        "grep" => Some(vec![Effect::ReadsFs]),
+        "find" => Some(vec![Effect::ReadsFs]),
+        "git" => Some(vec![Effect::ReadsFs, Effect::WritesFs]),
+        _ => None,
     }
 }
 
@@ -141,20 +142,12 @@ struct ProcessDecl {
 
 impl ProcessDecl {
     fn parse(s: &str) -> Result<Self, String> {
-        let (name, effects_str) = s
-            .split_once(':')
-            .ok_or_else(|| format!("expected NAME:EFFECTS, got {:?}", s))?;
+        let name = s.trim();
         if name.is_empty() {
             return Err("process name must not be empty".to_string());
         }
-        let effects = effects_str
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| Effect::parse(s.trim()))
-            .collect::<Result<Vec<_>, _>>()?;
-        if effects.is_empty() {
-            return Err(format!("process {:?} must declare at least one effect", name));
-        }
+        let effects = known_process_effects(name)
+            .ok_or_else(|| format!("unknown process {:?}; no effect declaration in registry", name))?;
         Ok(ProcessDecl { name: name.to_string(), effects })
     }
 }
