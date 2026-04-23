@@ -37,6 +37,10 @@ struct Args {
     /// Expose a specific environment variable to JavaScript (can be repeated)
     #[arg(long = "env", value_name = "VAR_NAME")]
     env_vars: Vec<String>,
+
+    /// Declare a process capability (format: NAME:effect1,effect2; e.g. grep:reads-fs)
+    #[arg(long = "process", value_name = "NAME:EFFECTS")]
+    processes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +59,38 @@ struct ProviderConfig {
 enum MountMode {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Effect {
+    ReadsFs,
+    WritesFs,
+    HttpOut,
+    HttpIn,
+}
+
+impl Effect {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "reads-fs" => Ok(Effect::ReadsFs),
+            "writes-fs" => Ok(Effect::WritesFs),
+            "http-out" => Ok(Effect::HttpOut),
+            "http-in" => Ok(Effect::HttpIn),
+            other => Err(format!(
+                "unknown effect {:?}; expected reads-fs, writes-fs, http-out, or http-in",
+                other
+            )),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Effect::ReadsFs => "reads-fs",
+            Effect::WritesFs => "writes-fs",
+            Effect::HttpOut => "http-out",
+            Effect::HttpIn => "http-in",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +131,31 @@ impl FilesystemMount {
             }
         };
         canonical_target.starts_with(&mount)
+    }
+}
+
+struct ProcessDecl {
+    name: String,
+    effects: Vec<Effect>,
+}
+
+impl ProcessDecl {
+    fn parse(s: &str) -> Result<Self, String> {
+        let (name, effects_str) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected NAME:EFFECTS, got {:?}", s))?;
+        if name.is_empty() {
+            return Err("process name must not be empty".to_string());
+        }
+        let effects = effects_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| Effect::parse(s.trim()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if effects.is_empty() {
+            return Err(format!("process {:?} must declare at least one effect", name));
+        }
+        Ok(ProcessDecl { name: name.to_string(), effects })
     }
 }
 
@@ -384,6 +445,51 @@ fn env_get_callback<'s, 'i>(
     }
 }
 
+fn process_run_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    // SAFETY: The ProcessDecl pointer stored in the External outlives this callback because
+    // ProcessesCapability (which owns the Vec<ProcessDecl>) is held by SandboxConfig, which is
+    // held by main() and outlives every execute_js() call.
+    let decl = unsafe {
+        let Ok(ext) = v8::Local::<v8::External>::try_from(args.data()) else {
+            throw_error(scope, "proc: internal error: missing external data");
+            return;
+        };
+        &*(ext.value() as *const ProcessDecl)
+    };
+
+    let mut cmd_args: Vec<String> = Vec::new();
+    for i in 0..args.length() {
+        let Some(s) = args.get(i).to_string(scope) else {
+            throw_error(scope, &format!("proc.{}: argument {} is not a string", decl.name, i));
+            return;
+        };
+        cmd_args.push(s.to_rust_string_lossy(scope));
+    }
+
+    match std::process::Command::new(&decl.name).args(&cmd_args).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let result = serde_json::json!({
+                "stdout": stdout,
+                "stderr": stderr,
+                "exitCode": output.status.code().unwrap_or(-1),
+            });
+            let json = result.to_string();
+            let Some(sv) = v8::String::new(scope, &json) else {
+                throw_error(scope, "proc: out of memory creating result");
+                return;
+            };
+            rv.set(sv.into());
+        }
+        Err(e) => throw_error(scope, &format!("proc.{}: failed to spawn: {}", decl.name, e)),
+    }
+}
+
 /// A sandbox capability bundles two things that must stay in sync:
 /// the V8 host functions it registers, and the system prompt text that describes them.
 ///
@@ -516,6 +622,55 @@ or `null` if it is not set. Only these variables are accessible: {}.",
     }
 }
 
+struct ProcessesCapability {
+    processes: Vec<ProcessDecl>,
+}
+
+impl Capability for ProcessesCapability {
+    fn system_prompt_snippet(&self) -> String {
+        self.processes
+            .iter()
+            .map(|p| {
+                let effects = p
+                    .effects
+                    .iter()
+                    .map(|e| format!("`{}`", e.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "- `proc.{}(arg, ...)` — runs `{}` with the given string arguments; \
+                    declared effects: {}. \
+                    Returns a JSON string `{{\"stdout\":\"...\",\"stderr\":\"...\",\"exitCode\":N}}`.",
+                    p.name, p.name, effects
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn register<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_, ()>,
+        global: v8::Local<'s, v8::ObjectTemplate>,
+    ) {
+        let proc_obj = v8::ObjectTemplate::new(scope);
+        for decl in &self.processes {
+            let data: v8::Local<v8::Value> =
+                v8::External::new(scope, decl as *const ProcessDecl as *mut c_void).into();
+            let fn_template =
+                v8::FunctionTemplate::builder(process_run_callback).data(data).build(scope);
+            proc_obj.set(
+                v8::String::new(scope, &decl.name).expect("out of memory").into(),
+                fn_template.into(),
+            );
+        }
+        global.set(
+            v8::String::new(scope, "proc").expect("out of memory").into(),
+            proc_obj.into(),
+        );
+    }
+}
+
 struct SandboxConfig {
     capabilities: Vec<Box<dyn Capability>>,
 }
@@ -531,6 +686,13 @@ impl SandboxConfig {
         }
         if !args.env_vars.is_empty() {
             capabilities.push(Box::new(EnvCapability { allowlist: args.env_vars.clone() }));
+        }
+        let mut process_decls: Vec<ProcessDecl> = Vec::new();
+        for spec in &args.processes {
+            process_decls.push(ProcessDecl::parse(spec)?);
+        }
+        if !process_decls.is_empty() {
+            capabilities.push(Box::new(ProcessesCapability { processes: process_decls }));
         }
         Ok(SandboxConfig { capabilities })
     }
